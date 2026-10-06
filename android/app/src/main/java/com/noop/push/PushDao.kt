@@ -22,9 +22,14 @@ internal object PushSnapshotPreflight {
         }
     }
 
-    fun query(table: String, columns: List<String>, predicate: String, orderBy: String): String =
-        "SELECT COALESCE(SUM(${rowEstimateExpression(columns)}), 0) FROM " +
-            "(SELECT ${columns.joinToString()} FROM $table WHERE $predicate ORDER BY $orderBy LIMIT ?)"
+    fun query(
+        table: String,
+        columns: List<String>,
+        predicate: String,
+        orderBy: String,
+        projections: List<String> = columns,
+    ): String = "SELECT COALESCE(SUM(${rowEstimateExpression(columns)}), 0) FROM " +
+        "(SELECT ${projections.joinToString()} FROM $table WHERE $predicate ORDER BY $orderBy LIMIT ?)"
 }
 
 internal object PushDeviceDiscovery {
@@ -44,7 +49,7 @@ internal object PushDeviceDiscovery {
 class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshotSource {
     override suspend fun knownDeviceIds(capabilities: PushCapabilities): List<String> = db.withTransaction {
         val supportedTables = capabilities.appendTables.map(::appendSpec) +
-            capabilities.mutableTables.map(::mutableSpec)
+            capabilities.mutableTables.map { mutableSpec(it, capabilities.protocolVersion) }
         val sql = PushDeviceDiscovery.query(supportedTables.map(TableSpec::sqlName))
         db.query(SimpleSQLiteQuery(sql)).use { cursor ->
             buildList {
@@ -102,9 +107,17 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
         deviceId: String,
         window: PushWindow,
         limit: Int,
+    ): List<PushMutableRecord> = mutableRows(table, deviceId, window, limit, PushProtocol.VERSION)
+
+    override suspend fun mutableRows(
+        table: PushMutableTable,
+        deviceId: String,
+        window: PushWindow,
+        limit: Int,
+        protocolVersion: String,
     ): List<PushMutableRecord> {
         require(limit in 1..(PushProtocol.MAX_MUTABLE_SNAPSHOT_RECORDS + 1))
-        val spec = mutableSpec(table)
+        val spec = mutableSpec(table, protocolVersion)
         return db.withTransaction {
             val (predicate, bounds) = when (table) {
                 PushMutableTable.DAILY_METRIC, PushMutableTable.JOURNAL ->
@@ -113,7 +126,7 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
                     "startTs >= ? AND startTs < ?" to
                         arrayOf<Any?>(window.startTsInclusive, window.endTsExclusive)
             }
-            val sql = "SELECT ${spec.columns.joinToString()} FROM ${spec.sqlName} " +
+            val sql = "SELECT ${spec.projections.joinToString()} FROM ${spec.sqlName} " +
                 "WHERE deviceId = ? AND $predicate ORDER BY ${spec.keyColumns.joinToString()} ASC LIMIT ?"
             val args = arrayOfNulls<Any?>(bounds.size + 2)
             args[0] = deviceId
@@ -125,6 +138,7 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
                     spec.columns,
                     "deviceId = ? AND $predicate",
                     "${spec.keyColumns.joinToString()} ASC",
+                    spec.projections,
                 ),
                 args,
             )
@@ -182,8 +196,10 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
         val keyColumns: List<String>,
         val dataColumns: List<String>,
         val booleanColumns: Set<String> = emptySet(),
+        val projectionOverrides: Map<String, String> = emptyMap(),
     ) {
         val columns: List<String> = keyColumns + dataColumns
+        val projections: List<String> = columns.map { projectionOverrides[it] ?: it }
     }
 
     private fun appendSpec(table: PushAppendTable): TableSpec = when (table) {
@@ -197,8 +213,11 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
         PushAppendTable.GRAVITY_SAMPLE -> GRAVITY
     }
 
-    private fun mutableSpec(table: PushMutableTable): TableSpec = when (table) {
-        PushMutableTable.DAILY_METRIC -> DAILY
+    private fun mutableSpec(
+        table: PushMutableTable,
+        protocolVersion: String = PushProtocol.VERSION,
+    ): TableSpec = when (table) {
+        PushMutableTable.DAILY_METRIC -> if (protocolVersion == PushProtocol.LATEST_VERSION) DAILY_V11 else DAILY
         PushMutableTable.SLEEP_SESSION -> SLEEP
         PushMutableTable.WORKOUT -> WORKOUT
         PushMutableTable.JOURNAL -> JOURNAL
@@ -235,6 +254,14 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
                 "totalSleepMin", "efficiency", "deepMin", "remMin", "lightMin",
                 "disturbances", "restingHr", "avgHrv", "recovery", "strain", "exerciseCount", "spo2Pct",
                 "skinTempDevC", "respRateBpm", "steps", "activeKcalEst", "spo2Red", "spo2Ir",
+            ),
+        )
+        val DAILY_V11 = DAILY.copy(
+            dataColumns = DAILY.dataColumns + "sleepPerformance",
+            projectionOverrides = mapOf(
+                "sleepPerformance" to "(SELECT value FROM metricSeries AS pushScore " +
+                    "WHERE pushScore.deviceId = dailyMetric.deviceId AND pushScore.day = dailyMetric.day " +
+                    "AND pushScore.key = 'sleep_performance' LIMIT 1) AS sleepPerformance",
             ),
         )
         val SLEEP = TableSpec(
