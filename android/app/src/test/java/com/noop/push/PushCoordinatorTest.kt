@@ -524,6 +524,7 @@ class PushCoordinatorTest {
                 "recovery" to null, "strain" to null, "exerciseCount" to null, "spo2Pct" to null,
                 "skinTempDevC" to null, "respRateBpm" to null, "steps" to null, "activeKcalEst" to null,
                 "spo2Red" to null, "spo2Ir" to null, "sleepPerformance" to 88.0,
+                "sleepConsistency" to 73.0,
             ),
         )
         val source = FakePushSource(
@@ -542,6 +543,7 @@ class PushCoordinatorTest {
         val batch = transport.batches.single()
         assertEquals(PushProtocol.LATEST_VERSION, batch.protocolVersion)
         assertTrue(batch.body.toString(Charsets.UTF_8).contains("\"sleepPerformance\":88.0"))
+        assertTrue(batch.body.toString(Charsets.UTF_8).contains("\"sleepConsistency\":73.0"))
     }
 
     @Test

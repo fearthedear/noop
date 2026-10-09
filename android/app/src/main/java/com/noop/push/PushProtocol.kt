@@ -427,9 +427,13 @@ object PushProtocol {
             throw PushProtocolException("${table.wireName} data does not match registry")
         }
         if (table == PushMutableTable.DAILY_METRIC && protocolVersion == LATEST_VERSION) {
-            val score = data["sleepPerformance"]
-            if (score != null && (score !is Number || !score.toDouble().isFinite() || score.toDouble() !in 0.0..100.0)) {
-                throw PushProtocolException("dailyMetric.sleepPerformance must be null or within 0..100")
+            for (name in listOf("sleepPerformance", "sleepConsistency")) {
+                val score = data[name]
+                if (score != null &&
+                    (score !is Number || !score.toDouble().isFinite() || score.toDouble() !in 0.0..100.0)
+                ) {
+                    throw PushProtocolException("dailyMetric.$name must be null or within 0..100")
+                }
             }
         }
         if ("deviceId" in key || "deviceId" in data || "synced" in data) {
@@ -440,7 +444,7 @@ object PushProtocol {
     private fun dataMembers(table: PushTable, protocolVersion: String): List<String> {
         val members = REGISTRY.getValue(table.wireName).second
         return if (table == PushMutableTable.DAILY_METRIC && protocolVersion == LATEST_VERSION) {
-            members + "sleepPerformance"
+            members + listOf("sleepPerformance", "sleepConsistency")
         } else members
     }
 

@@ -4,6 +4,8 @@ import android.database.Cursor
 import androidx.room.withTransaction
 import androidx.sqlite.db.SimpleSQLiteQuery
 import com.noop.data.WhoopDatabase
+import java.time.LocalDate
+import java.time.ZoneId
 
 /** SQL-side upper bound evaluated before Android materializes any unrestricted TEXT value. */
 internal object PushSnapshotPreflight {
@@ -142,12 +144,85 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
                 ),
                 args,
             )
-            db.query(SimpleSQLiteQuery(sql, args)).use { cursor ->
+            val records = db.query(SimpleSQLiteQuery(sql, args)).use { cursor ->
                 buildList {
                     while (cursor.moveToNext()) add(cursor.mutableRecord(spec))
                 }
             }
+            if (table != PushMutableTable.DAILY_METRIC ||
+                protocolVersion != PushProtocol.LATEST_VERSION || records.isEmpty()
+            ) {
+                records
+            } else if (records.last().data["sleepConsistency"] != null) {
+                // SleepModel prefers the imported consistency series as a whole when its latest day has a
+                // point; don't mix imported values and the locally calculated fallback in one series.
+                records
+            } else {
+                // When the latest day has no imported consistency score, SleepModel uses the local
+                // bedtime-spread calculation for the series. Never substitute recovery or performance.
+                val computedConsistency = sleepConsistencyByWakeDay(deviceId, window)
+                records.map { record ->
+                    val day = record.key["day"] as? String
+                    record.copy(data = record.data + ("sleepConsistency" to day?.let(computedConsistency::get)))
+                }
+            }
         }
+    }
+
+    /**
+     * Compute the existing trailing-14 bedtime-onset score for each local wake day in the export window.
+     * Fetching the previous 13 sessions before the first in-window wake keeps the first exported score
+     * identical to the Sleep screen without loading unbounded sleep history.
+     */
+    private fun sleepConsistencyByWakeDay(deviceId: String, window: PushWindow): Map<String, Double> {
+        val zone = ZoneId.systemDefault()
+        val start = LocalDate.parse(window.fromDay).atStartOfDay(zone).toEpochSecond()
+        val end = LocalDate.parse(window.toDay).plusDays(1).atStartOfDay(zone).toEpochSecond()
+        val inWindow = db.query(
+            SimpleSQLiteQuery(
+                "SELECT startTs, endTs, startTsAdjusted FROM sleepSession " +
+                    "WHERE deviceId = ? AND endTs >= ? AND endTs < ? ORDER BY startTs ASC LIMIT ?",
+                arrayOf(deviceId, start, end, PushProtocol.MAX_MUTABLE_SNAPSHOT_RECORDS + 1),
+            ),
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    val adjusted = cursor.getColumnIndexOrThrow("startTsAdjusted")
+                    add(
+                        SleepConsistencySession(
+                            startTs = cursor.getLong(cursor.getColumnIndexOrThrow("startTs")),
+                            endTs = cursor.getLong(cursor.getColumnIndexOrThrow("endTs")),
+                            startTsAdjusted = if (cursor.isNull(adjusted)) null else cursor.getLong(adjusted),
+                        ),
+                    )
+                }
+            }
+        }
+        if (inWindow.size > PushProtocol.MAX_MUTABLE_SNAPSHOT_RECORDS) {
+            throw PushProtocolException("sleep consistency snapshot exceeds local row limit")
+        }
+        val firstStartTs = inWindow.firstOrNull()?.startTs ?: return emptyMap()
+        val prior = db.query(
+            SimpleSQLiteQuery(
+                "SELECT startTs, endTs, startTsAdjusted FROM sleepSession " +
+                    "WHERE deviceId = ? AND startTs < ? ORDER BY startTs DESC LIMIT 13",
+                arrayOf(deviceId, firstStartTs),
+            ),
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    val adjusted = cursor.getColumnIndexOrThrow("startTsAdjusted")
+                    add(
+                        SleepConsistencySession(
+                            startTs = cursor.getLong(cursor.getColumnIndexOrThrow("startTs")),
+                            endTs = cursor.getLong(cursor.getColumnIndexOrThrow("endTs")),
+                            startTsAdjusted = if (cursor.isNull(adjusted)) null else cursor.getLong(adjusted),
+                        ),
+                    )
+                }
+            }
+        }.asReversed()
+        return SleepConsistencyPushProjection.byWakeDay(prior + inWindow, zone)
     }
 
     private fun ensureSnapshotBounded(sql: String, args: Array<Any?>) {
@@ -257,11 +332,14 @@ class PushDao internal constructor(private val db: WhoopDatabase) : PushSnapshot
             ),
         )
         val DAILY_V11 = DAILY.copy(
-            dataColumns = DAILY.dataColumns + "sleepPerformance",
+            dataColumns = DAILY.dataColumns + listOf("sleepPerformance", "sleepConsistency"),
             projectionOverrides = mapOf(
                 "sleepPerformance" to "(SELECT value FROM metricSeries AS pushScore " +
                     "WHERE pushScore.deviceId = dailyMetric.deviceId AND pushScore.day = dailyMetric.day " +
                     "AND pushScore.key = 'sleep_performance' LIMIT 1) AS sleepPerformance",
+                "sleepConsistency" to "(SELECT value FROM metricSeries AS pushConsistency " +
+                    "WHERE pushConsistency.deviceId = dailyMetric.deviceId AND pushConsistency.day = dailyMetric.day " +
+                    "AND pushConsistency.key = 'sleep_consistency' LIMIT 1) AS sleepConsistency",
             ),
         )
         val SLEEP = TableSpec(

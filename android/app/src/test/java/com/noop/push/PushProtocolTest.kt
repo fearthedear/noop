@@ -25,7 +25,7 @@ class PushProtocolTest {
     }
 
     @Test
-    fun version11AddsOnlyTheExplicitDailySleepPerformanceProjection() {
+    fun version11AddsOnlyTheExplicitDailySleepScoreProjections() {
         val score = PushMutableRecord(
             linkedMapOf("day" to "2026-08-18"),
             linkedMapOf(
@@ -34,6 +34,7 @@ class PushProtocolTest {
                 "recovery" to null, "strain" to null, "exerciseCount" to null, "spo2Pct" to null,
                 "skinTempDevC" to null, "respRateBpm" to null, "steps" to null, "activeKcalEst" to null,
                 "spo2Red" to null, "spo2Ir" to null, "sleepPerformance" to 87.5,
+                "sleepConsistency" to 82.0,
             ),
         )
         val batch = PushProtocol.mutableBatch(
@@ -43,6 +44,7 @@ class PushProtocolTest {
         val lines = batch.body.toString(Charsets.UTF_8).trimEnd().lines()
         assertEquals("1.1", JSONObject(lines.first()).getString("protocolVersion"))
         assertEquals(87.5, JSONObject(lines[1]).getJSONObject("data").getDouble("sleepPerformance"), 0.0)
+        assertEquals(82.0, JSONObject(lines[1]).getJSONObject("data").getDouble("sleepConsistency"), 0.0)
         assertTrue(PushAck.parse(PushAck.fromBatch(batch).encode(), PushProtocol.LATEST_VERSION).exactlyMatches(batch))
 
         var rejectedByV10 = false
@@ -67,6 +69,18 @@ class PushProtocolTest {
             rejectedOutOfRangeScore = true
         }
         assertTrue("sleepPerformance must be bounded to 0..100", rejectedOutOfRangeScore)
+
+        var rejectedOutOfRangeConsistency = false
+        try {
+            PushProtocol.mutableBatch(
+                PushMutableTable.DAILY_METRIC, SOURCE_A, "strap-noop", testWindow(),
+                listOf(score.copy(data = score.data + ("sleepConsistency" to 101.0))),
+                PushProtocol.LATEST_VERSION,
+            )
+        } catch (_: PushProtocolException) {
+            rejectedOutOfRangeConsistency = true
+        }
+        assertTrue("sleepConsistency must be bounded to 0..100", rejectedOutOfRangeConsistency)
     }
 
     @Test
